@@ -32,7 +32,7 @@ No external dependencies beyond standard coreutils (`awk`, `ps`, `df`, `who`) â€
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/server-stats.git
+git clone https://github.com/l3fth4nd/server-stats.git
 cd server-stats
 chmod +x server-stats.sh
 ```
