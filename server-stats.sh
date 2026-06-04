@@ -52,37 +52,53 @@ pct() {
 }
 
 # ----------------------------------------------------------------------------
-# 1. CPU usage
+# 1. CPU usage — sampled over one shared 1-second window
 #
-# We sample the aggregate "cpu" line of /proc/stat twice, ~1s apart, and
-# diff the counters. Each value is "jiffies spent in a state since boot".
-# Busy fraction over the interval = (Δtotal - Δidle) / Δtotal.
-#
-# Why not `top`? `top` reports the same thing but its output format varies
-# across versions and locales, and batch mode still needs a sampling delay.
-# Reading /proc/stat ourselves is portable and dependency-free.
+# _take_cpu_snapshot reads /proc/stat (aggregate) and every /proc/[pid]/stat
+# (per-process utime+stime) in a single pass. Calling it twice with sleep 1
+# between lets us compute both overall CPU% and instantaneous per-process
+# CPU% from the same interval — one sleep total, not two.
 # ----------------------------------------------------------------------------
 
-read_cpu_counters() {
-    # Prints: "<total_jiffies> <idle_jiffies>"
-    # Fields: user nice system idle iowait irq softirq steal guest guest_nice
-    local _cpu user nice system idle iowait irq softirq steal _rest
-    read -r _cpu user nice system idle iowait irq softirq steal _rest < /proc/stat
-    local total=$(( user + nice + system + idle + iowait + irq + softirq + steal ))
-    local idle_all=$(( idle + iowait ))   # iowait = CPU idle waiting on I/O
-    printf '%s %s\n' "$total" "$idle_all"
+_take_cpu_snapshot() {
+    awk '/^cpu /{t=0; for(i=2;i<=NF;i++) t+=$i; print "SYS",t,$5+$6}' /proc/stat
+    for f in /proc/[0-9]*/stat; do
+        [ -r "$f" ] || continue
+        awk 'NR==1{
+            match($0,/\(.*\)/)
+            rest=substr($0,RSTART+RLENGTH+2)
+            split(rest,a," ")
+            if(length(a)>=13) printf "PID %s %d\n",$1,a[12]+a[13]
+        }' "$f" 2>/dev/null
+    done
 }
 
-cpu_usage_pct() {
-    local t0 i0 t1 i1
-    read -r t0 i0 <<< "$(read_cpu_counters)"
+# Prints two kinds of lines (consumed by main):
+#   overall <pct>
+#   proc <pid> <pct>   (top 5, descending)
+cpu_and_top_procs() {
+    local s0 s1
+    s0=$(_take_cpu_snapshot)
     sleep 1
-    read -r t1 i1 <<< "$(read_cpu_counters)"
+    s1=$(_take_cpu_snapshot)
 
+    local t0 i0 t1 i1
+    read -r _ t0 i0 <<< "$(grep '^SYS' <<< "$s0")"
+    read -r _ t1 i1 <<< "$(grep '^SYS' <<< "$s1")"
     local dt=$(( t1 - t0 ))
-    local di=$(( i1 - i0 ))
-    if [ "$dt" -le 0 ]; then echo "0.0"; return; fi
-    awk -v dt="$dt" -v di="$di" 'BEGIN { printf "%.1f", (dt - di) / dt * 100 }'
+    [ "$dt" -le 0 ] && dt=1
+
+    printf 'overall %s\n' "$(awk -v dt="$dt" -v di="$(( i1 - i0 ))" \
+        'BEGIN{printf "%.1f",(dt-di)/dt*100}')"
+
+    awk -v dt="$dt" '
+        NR==FNR && /^PID/ { t[$2]=$3; next }
+        /^PID/ {
+            pid=$2; delta=$3-(t[pid]+0)
+            if (pid in t && delta>0) printf "%.4f %s\n", delta/dt*100, pid
+        }
+    ' <(printf '%s\n' "$s0") <(printf '%s\n' "$s1") \
+        | sort -rn | head -5 | awk '{printf "proc %s %.1f\n",$2,$1}'
 }
 
 # ----------------------------------------------------------------------------
@@ -113,6 +129,15 @@ print_memory() {
     printf '  Total : %s\n'            "$(human_kib "$total")"
     printf '  Used  : %s  (%s)\n'      "$(human_kib "$used")"  "$(pct "$used"  "$total")"
     printf '  Free  : %s  (%s)\n'      "$(human_kib "$avail")" "$(pct "$avail" "$total")"
+
+    local swap_total swap_free swap_used
+    swap_total=$(awk '/^SwapTotal:/ {print $2; exit}' /proc/meminfo)
+    swap_free=$(awk  '/^SwapFree:/  {print $2; exit}' /proc/meminfo)
+    if [ -n "${swap_total:-}" ] && [ "$swap_total" -gt 0 ]; then
+        swap_used=$(( swap_total - swap_free ))
+        printf '  Swap  : %s used / %s total  (%s)\n' \
+            "$(human_kib "$swap_used")" "$(human_kib "$swap_total")" "$(pct "$swap_used" "$swap_total")"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -140,6 +165,11 @@ print_disk() {
         '
     )
 
+    if [ "${total:-0}" -eq 0 ]; then
+        printf '  (no standard block filesystem detected — overlay/exotic root?)\n'
+        return
+    fi
+
     # df's own "Use%" is used/(used+avail), i.e. it ignores root-reserved
     # blocks. We follow that convention so Used%+Free% sum to 100 and reconcile
     # with `df`; Size is shown separately as the raw filesystem total.
@@ -147,28 +177,48 @@ print_disk() {
     printf '  Size  : %s  (filesystem total, incl. reserved)\n' "$(human_kib "$total")"
     printf '  Used  : %s  (%s)\n' "$(human_kib "$used")"  "$(pct "$used"  "$base")"
     printf '  Free  : %s  (%s)\n' "$(human_kib "$avail")" "$(pct "$avail" "$base")"
+
+    local itotal iused iavail
+    read -r itotal iused iavail < <(
+        df -PTi 2>/dev/null | awk '
+            NR > 1 && $2 ~ /^(ext[2-4]|xfs|btrfs|zfs|f2fs|jfs|reiserfs|vfat|exfat|ntfs3?|fuseblk|ufs|hfsplus)$/ {
+                t += $3; u += $4; a += $5
+            }
+            END { printf "%d %d %d\n", t, u, a }
+        '
+    )
+    if [ "${itotal:-0}" -gt 0 ]; then
+        printf '  Inodes: %d used / %d total  (%s)\n' "$iused" "$itotal" "$(pct "$iused" "$itotal")"
+    fi
 }
 
 # ----------------------------------------------------------------------------
-# 4 & 5. Top processes by CPU / memory  (source: ps)
-#
-# `ps --sort` does the ranking in-kernel/in-tool; we just take the top 5.
-# Caveat worth knowing: ps %cpu is lifetime-average (total CPU time / wall
-# time alive), NOT the instantaneous rate `top` shows. A long-lived daemon
-# can therefore show a modest %cpu even while spiking right now. For a
-# point-in-time snapshot this is the standard, portable answer.
+# 4 & 5. Top processes by CPU (instantaneous) / memory
 # ----------------------------------------------------------------------------
 
 print_top_cpu() {
-    ps -eo pid,user,%cpu,comm --sort=-%cpu 2>/dev/null \
-        | awk 'NR==1 {printf "  %-8s %-12s %6s  %s\n", $1,$2,$3,$4; next}
-               NR<=6 {printf "  %-8s %-12s %6s  %s\n", $1,$2,$3,$4}'
+    local cpu_data="$1"
+    printf '  %-8s %-16s %6s  %s\n' "PID" "USER" "%CPU" "COMMAND"
+    while IFS=' ' read -r _ pid pct; do
+        local info user comm
+        info=$(ps -p "$pid" -o user:16=,comm= 2>/dev/null | head -1) || continue
+        [ -z "$info" ] && continue
+        user=$(awk '{print $1}' <<< "$info")
+        comm=$(awk '{print $2}' <<< "$info")
+        printf '  %-8s %-16s %6s  %s\n' "$pid" "$user" "$pct" "$comm"
+    done < <(grep '^proc ' <<< "$cpu_data")
+}
+
+print_top_cpu_lifetime() {
+    ps -eo pid,user:16,%cpu,comm --sort=-%cpu 2>/dev/null \
+        | awk 'NR==1 {printf "  %-8s %-16s %6s  %s\n", $1,$2,$3,$4; next}
+               NR<=6 {printf "  %-8s %-16s %6s  %s\n", $1,$2,$3,$4}'
 }
 
 print_top_mem() {
-    ps -eo pid,user,%mem,comm --sort=-%mem 2>/dev/null \
-        | awk 'NR==1 {printf "  %-8s %-12s %6s  %s\n", $1,$2,$3,$4; next}
-               NR<=6 {printf "  %-8s %-12s %6s  %s\n", $1,$2,$3,$4}'
+    ps -eo pid,user:16,%mem,comm --sort=-%mem 2>/dev/null \
+        | awk 'NR==1 {printf "  %-8s %-16s %6s  %s\n", $1,$2,$3,$4; next}
+               NR<=6 {printf "  %-8s %-16s %6s  %s\n", $1,$2,$3,$4}'
 }
 
 # ----------------------------------------------------------------------------
@@ -212,10 +262,10 @@ print_failed_logins() {
         n=$(lastb 2>/dev/null | grep -cve '^$' -e '^btmp begins')
         printf '  Failed login attempts (recent): %s\n' "$n"
         lastb 2>/dev/null | grep -v -e '^$' -e '^btmp begins' | head -5 \
-            | awk '{printf "    %-12s from %-15s %s %s %s\n", $1,$3,$4,$5,$6}'
+            | awk '{printf "    %s\n", $0}'
     elif command -v journalctl >/dev/null 2>&1; then
         local n
-        n=$(journalctl _SYSTEMD_UNIT=sshd.service 2>/dev/null | grep -c "Failed password")
+        n=$(journalctl -b _SYSTEMD_UNIT=sshd.service 2>/dev/null | grep -c "Failed password")
         printf '  Failed SSH password attempts (journal): %s\n' "$n"
     else
         printf '  Failed login data unavailable (need root / no btmp / no journald)\n'
@@ -229,8 +279,11 @@ print_failed_logins() {
 main() {
     printf '%sServer performance report%s  —  %s\n' "$BOLD" "$RESET" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
+    local _cpu
+    _cpu=$(cpu_and_top_procs)
+
     section "CPU usage"
-    printf '  Total CPU usage : %s%%\n' "$(cpu_usage_pct)"
+    printf '  Total CPU usage : %s%%\n' "$(awk '/^overall/{print $2}' <<< "$_cpu")"
 
     section "Memory usage"
     print_memory
@@ -239,7 +292,10 @@ main() {
     print_disk
 
     section "Top 5 processes by CPU"
-    print_top_cpu
+    print_top_cpu "$_cpu"
+
+    section "Top 5 processes by CPU (lifetime avg)"
+    print_top_cpu_lifetime
 
     section "Top 5 processes by memory"
     print_top_mem
